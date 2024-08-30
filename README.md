@@ -47,3 +47,64 @@ if __name__ == "__main__":
 ```bash
 pyton main.py 
 ```
+
+5. Openapi 
+```json
+{
+  "openapi":"3.1.0",
+  "info":{
+    "title":"FastAPI",
+    "version":"0.1.0"
+  },
+  "paths":{
+    "/":{
+      "get":{
+        "summary":"Index",
+        "operationId":"index__get",
+        "responses":{
+          "200":{
+            "description":"Successful Response",
+            "content":{
+              "application/json":{
+                "schema":{ }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health":{
+      "get":{
+        "summary":"Health",
+        "operationId":"health_health_get",
+        "responses":{
+          "200":{
+            "description":"Successful Response",
+            "content":{
+              "application/json":{
+                "schema":{ }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/predict":{
+      "post":{
+        "summary":"Predict",
+        "operationId":"predict_predict_post",
+        "responses":{
+          "200":{
+            "description":"Successful Response",
+            "content":{
+              "application/json":{
+                "schema":{ }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
