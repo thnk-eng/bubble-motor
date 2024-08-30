@@ -43,7 +43,7 @@ if __name__ == "__main__":
     asyncio.run(server.run())
 ```
 
-4. Test it oot
+4. Test it out
 ```bash
 pyton main.py 
 ```
