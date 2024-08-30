@@ -1,0 +1,11 @@
+aiohttp==3.10.5
+aiohttp-cors==0.7.0
+ariadne==0.23.0
+asgi-lifespan==2.1.0
+fastapi==0.112.2
+graphene==3.3
+graphql-core==3.2.3
+graphql-relay==3.2.0
+pydantic==2.8.2
+uvicorn==0.30.6
+uvloop==0.20.0
