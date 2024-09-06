@@ -45,7 +45,7 @@ if __name__ == "__main__":
 
 4. Test it out
 ```bash
-pyton main.py 
+python main.py 
 ```
 
 5. Openapi 
