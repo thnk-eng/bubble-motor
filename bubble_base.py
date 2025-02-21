@@ -2,7 +2,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING, Callable, List
 
 if TYPE_CHECKING:
-    from .server import BubbleServer
+    from server import BubbleServer
 
 
 class BubbleSpec:

@@ -1,45 +1,40 @@
+# bubble-motor/server.py
+
 import asyncio
 import copy
 import inspect
 import logging
 import multiprocessing as mp
 import os
-import pickle
+import json
 import shutil
-import threading
-import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from queue import Empty, Queue
 from typing import Dict, List, Optional, Sequence, Tuple, Union
-from pydantic import BaseModel
-import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
-from fastapi.security import APIKeyHeader
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, APIRouter
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import OAuth2PasswordBearer
 from starlette.middleware.gzip import GZipMiddleware
 from ariadne import QueryType, MutationType, make_executable_schema
 from ariadne.asgi import GraphQL
 import sys
-from .api import BubbleAPI
-from .auth import api_key_auth, no_auth
-from .connector import _Connector
-from .example_openai_spec import OpenAISpec
-from .bubble_base import BubbleSpec
-from .utils import BubbleAPIStatus, MaxSizeMiddleware, load_and_raise
+import signal
+
+from api import BubbleAPI
+from auth import router as auth_router, get_authentication_dependency
+from connector import _Connector
+from example_openai_spec import OpenAISpec
+from bubble_base import BubbleSpec
+from utils import BubbleAPIStatus, MaxSizeMiddleware, load_and_raise
 
 mp.allow_connection_pickling()
 
 logger = logging.getLogger(__name__)
 
-BUBBLE_SERVER_API_KEY = os.environ.get("BUBBLE_SERVER_API_KEY")
 LONG_TIMEOUT = 100
-
-
-class PredictionRequest(BaseModel):
-    input_data: Union[str, dict]
 
 
 # Define the GraphQL schema using Ariadne
@@ -69,16 +64,12 @@ async def resolve_get_result(_, info, request_id):
     if request_id not in server.response_buffer:
         logger.warning(f"GraphQL: Result request for unknown request ID: {request_id}")
         return {"request_id": request_id, "status": "not_found", "result": None}
-    event = server.response_buffer[request_id]
-    try:
-        await asyncio.wait_for(event.wait(), timeout=1.0)
-        result, status = server.response_buffer.pop(request_id)
-        if status == BubbleAPIStatus.ERROR:
-            return {"request_id": request_id, "status": "error", "result": str(result)}
-        logger.info(f"GraphQL: Result retrieved for request ID: {request_id}")
-        return {"request_id": request_id, "status": "completed", "result": str(result)}
-    except asyncio.TimeoutError:
-        logger.info(f"GraphQL: Result not ready for request ID: {request_id}")
+    response, status = server.response_buffer.get(request_id, (None, "processing"))
+    if status == BubbleAPIStatus.ERROR:
+        return {"request_id": request_id, "status": "error", "result": response.get("error", "Unknown error")}
+    elif status == BubbleAPIStatus.OK:
+        return {"request_id": request_id, "status": "completed", "result": response}
+    else:
         return {"request_id": request_id, "status": "processing", "result": None}
 
 
@@ -87,8 +78,8 @@ async def resolve_predict(_, info, input_data):
     server = info.context["request"].app.state.bubble_server
     request_id = str(uuid.uuid4())
     event = asyncio.Event()
-    server.response_buffer[request_id] = event
-    server.request_queue.put((server.response_queue_id, request_id, asyncio.get_event_loop().time(), input_data))
+    server.response_buffer[request_id] = (event, BubbleAPIStatus.PROCESSING)
+    server.request_queue.put((server.response_queue_id, request_id, asyncio.get_event_loop().time(), {"input": input_data}))
     logger.info(f"GraphQL: Prediction request received. Request ID: {request_id}")
     return {"request_id": request_id, "status": "processing", "result": None}
 
@@ -143,16 +134,17 @@ async def inference_worker(
         stream: bool,
         workers_setup_status: Dict[str, bool] = None,
 ):
+    loop = asyncio.get_event_loop()
     await bubble_api.setup(device)
     bubble_api.device = device
 
     print(f"Setup complete for worker {worker_id}.")
 
-    if workers_setup_status:
+    if workers_setup_status is not None:
         workers_setup_status[worker_id] = True
 
     if bubble_spec:
-        logging.info(f"bubble_server will use {bubble_spec.__class__.__name__} spec")
+        logging.info(f"bubble_motor will use {bubble_spec.__class__.__name__} spec")
 
     while True:
         batches, timed_out_uids = collate_requests(
@@ -165,7 +157,8 @@ async def inference_worker(
         for response_queue_id, uid in timed_out_uids:
             logger.error(f"Request {uid} timed out.")
             response_queues[response_queue_id].put(
-                (uid, (HTTPException(504, "Request timed out"), BubbleAPIStatus.ERROR)))
+                (uid, ({"error": "Request timed out."}, BubbleAPIStatus.ERROR))
+            )
 
         if not batches:
             await asyncio.sleep(0.01)
@@ -187,17 +180,20 @@ async def inference_worker(
                 for input, context in zip(inputs, contexts)
             ]
             x = bubble_api.batch(x)
-            y = await _inject_context(contexts, bubble_api.predict, x)
-            outputs = bubble_api.unbatch(y)
-            for response_queue_id, y, uid, context in zip(response_queue_ids, outputs, uids, contexts):
-                y_enc = _inject_context(context, bubble_api.encode_response, y)
+            y_gen = await _inject_context(contexts, bubble_api.predict, x)
+            y_enc_gen = await _inject_context(contexts, bubble_api.encode_response, y_gen)
+
+            for y_enc in y_enc_gen:
                 response_queues[response_queue_id].put((uid, (y_enc, BubbleAPIStatus.OK)))
+
+            for response_queue_id, uid in zip(response_queue_ids, uids):
+                response_queues[response_queue_id].put((uid, ("", BubbleAPIStatus.FINISH_STREAMING)))
 
         except Exception as e:
             logger.exception("Error processing batched request.")
-            err_pkl = pickle.dumps(e)
+            error_response = {"error": str(e)}
             for response_queue_id, uid in zip(response_queue_ids, uids):
-                response_queues[response_queue_id].put((uid, (err_pkl, BubbleAPIStatus.ERROR)))
+                response_queues[response_queue_id].put((uid, (error_response, BubbleAPIStatus.ERROR)))
 
 
 class BubbleServer:
@@ -213,8 +209,8 @@ class BubbleServer:
             api_path: str = "/predict",
             stream: bool = False,
             spec: Optional[BubbleSpec] = None,
-            max_payload_size=None,
-    ):
+            max_payload_size: Optional[int] = None,
+        ):
         if batch_timeout > timeout and timeout not in (False, -1):
             raise ValueError("batch_timeout must be less than timeout")
         if max_batch_size <= 0:
@@ -232,7 +228,7 @@ class BubbleServer:
         self.app = FastAPI(lifespan=self.lifespan)
         self.app.state.bubble_server = self
         self.response_queue_id = None
-        self.response_buffer = {}
+        self.response_buffer: Dict[str, Union[Tuple[deque, asyncio.Event, str], Dict]] = {}
         if not stream:
             self.app.add_middleware(GZipMiddleware, minimum_size=1000)
         if max_payload_size is not None:
@@ -268,9 +264,13 @@ class BubbleServer:
             device_list = devices
             if isinstance(devices, int):
                 device_list = range(devices)
-            self.devices = [self.device_identifiers(accelerator, device) for device in device_list]
+            self.devices = [f"{accelerator}:{el}" for el in device_list]
+        else:
+            self.devices = ["cpu"]
 
         self.workers = self.devices * self.workers_per_device
+        self.processes: List[mp.Process] = []
+        self.manager: Optional[mp.Manager] = None
 
         # Call setup_server only after request_type is set
         self.setup_server()
@@ -282,20 +282,16 @@ class BubbleServer:
         if not hasattr(self, "response_queues") or not self.response_queues:
             raise RuntimeError("Response queues have not been initialized.")
 
-        response_queue = self.response_queues[app.state.bubble_server.response_queue_id]
+        response_queue = self.response_queues[self.response_queue_id]
         response_executor = ThreadPoolExecutor(max_workers=len(self.devices) * self.workers_per_device)
-        future = self.response_queue_to_buffer(response_queue, self.response_buffer, self.stream, response_executor)
-        task = loop.create_task(future)
+        future = asyncio.create_task(self.response_queue_to_buffer(response_queue, self.response_buffer, self.stream, response_executor))
 
-        yield
-
-        task.cancel()
-        logger.debug("Shutting down response queue to buffer task")
-
-    def device_identifiers(self, accelerator, device):
-        if isinstance(device, Sequence):
-            return [f"{accelerator}:{el}" for el in device]
-        return [f"{accelerator}:{device}"]
+        try:
+            yield
+        finally:
+            future.cancel()
+            logger.debug("Shutting down response queue to buffer task")
+            await asyncio.sleep(0.1)
 
     async def data_streamer(self, q: deque, data_available: asyncio.Event, send_status: bool = False):
         while True:
@@ -319,11 +315,14 @@ class BubbleServer:
     def setup_server(self):
         workers_ready = False
 
-        @self.app.get("/", dependencies=[Depends(self.setup_auth())])
+        # Include the OAuth2 token router
+        self.app.include_router(auth_router)
+
+        @self.app.get("/", dependencies=[Depends(get_authentication_dependency())])
         async def index(request: Request) -> Response:
             return Response(content="bubble_server running")
 
-        @self.app.get("/health", dependencies=[Depends(self.setup_auth())])
+        @self.app.get("/health", dependencies=[Depends(get_authentication_dependency())])
         async def health(request: Request) -> Response:
             nonlocal workers_ready
             if not workers_ready:
@@ -338,15 +337,17 @@ class BubbleServer:
         async def predict(request: self.request_type,
                           background_tasks: BackgroundTasks) -> self.response_type:
             response_queue_id = self.app.state.bubble_server.response_queue_id
-            uid = uuid.uuid4()
+            uid = str(uuid.uuid4())
             event = asyncio.Event()
-            self.response_buffer[uid] = event
+            self.response_buffer[uid] = (event, BubbleAPIStatus.PROCESSING)
             logger.info(f"Received request uid={uid}")
 
             payload = request
             if self.request_type == Request:
-                if request.headers["Content-Type"] == "application/x-www-form-urlencoded" or request.headers[
-                    "Content-Type"].startswith("multipart/form-data"):
+                if request.headers.get("Content-Type") in (
+                    "application/x-www-form-urlencoded",
+                    "multipart/form-data",
+                ):
                     payload = await request.form()
                 else:
                     payload = await request.json()
@@ -363,10 +364,10 @@ class BubbleServer:
         async def stream_predict(request: self.request_type,
                                  background_tasks: BackgroundTasks) -> self.response_type:
             response_queue_id = self.app.state.bubble_server.response_queue_id
-            uid = uuid.uuid4()
+            uid = str(uuid.uuid4())
             event = asyncio.Event()
             q = deque()
-            self.response_buffer[uid] = (q, event)
+            self.response_buffer[uid] = (q, event, BubbleAPIStatus.PROCESSING)
             logger.debug(f"Received request uid={uid}")
 
             payload = request
@@ -384,27 +385,27 @@ class BubbleServer:
                 endpoint,
                 stream_predict if stream else predict,
                 methods=methods,
-                dependencies=[Depends(self.setup_auth())]
+                dependencies=[Depends(get_authentication_dependency())]
             )
 
         for spec in self._specs:
             spec: BubbleSpec
             for path, endpoint, methods in spec.endpoints:
                 self.app.add_api_route(
-                    path, endpoint=endpoint, methods=methods, dependencies=[Depends(self.setup_auth())]
+                    path, endpoint=endpoint, methods=methods, dependencies=[Depends(get_authentication_dependency())]
                 )
 
         # Setup GraphQL using Ariadne
         self.app.add_route("/graphql", GraphQL(schema=schema), methods=["GET", "POST"])
 
     async def launch_inference_worker(self, num_uvicorn_servers: int):
-        manager = mp.Manager()
-        self.workers_setup_status = manager.dict()
-        self.request_queue = manager.Queue()
+        self.manager = mp.Manager()
+        self.workers_setup_status = self.manager.dict()
+        self.request_queue = self.manager.Queue()
 
         self.response_queues = []
         for _ in range(num_uvicorn_servers):
-            response_queue = manager.Queue()
+            response_queue = self.manager.Queue()
             self.response_queues.append(response_queue)
 
         for spec in self._specs:
@@ -417,8 +418,8 @@ class BubbleServer:
 
         process_list = []
         for worker_id, device in enumerate(self.devices * self.workers_per_device):
-            if len(device) == 1:
-                device = device[0]
+            if isinstance(device, list):
+                device = device[0]  # Simplified device handling
 
             self.workers_setup_status[worker_id] = False
 
@@ -439,12 +440,18 @@ class BubbleServer:
                 ),
             )
             process.start()
+            self.processes.append(process)
             process_list.append(process)
-        return manager, process_list
+        return self.manager, process_list
 
     @staticmethod
     def inference_worker_process(*args, **kwargs):
-        asyncio.run(inference_worker(*args, **kwargs))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(inference_worker(*args, **kwargs))
+        finally:
+            loop.close()
 
     def generate_client_file(self):
         src_path = os.path.join(os.path.dirname(__file__), "python_client.py")
@@ -458,6 +465,37 @@ class BubbleServer:
             print(f"File '{src_path}' copied to '{dest_path}'")
         except Exception as e:
             print(f"Error copying file: {e}")
+
+    async def response_queue_to_buffer(
+            self,
+            response_queue: mp.Queue,
+            response_buffer: Dict[str, Union[Tuple[deque, asyncio.Event, str], Dict]],
+            stream: bool,
+            threadpool: ThreadPoolExecutor,
+    ):
+        loop = asyncio.get_running_loop()
+        if stream:
+            while True:
+                try:
+                    uid, response = await loop.run_in_executor(threadpool, response_queue.get)
+                except Empty:
+                    await asyncio.sleep(0.0001)
+                    continue
+                stream_response_buffer, event, status = response_buffer[uid]
+                stream_response_buffer.append((json.dumps(response), status))
+                event.set()
+        else:
+            while True:
+                try:
+                    uid, response = await loop.run_in_executor(threadpool, response_queue.get)
+                except Empty:
+                    await asyncio.sleep(0.0001)
+                    continue
+                response_buffer[uid] = (response, BubbleAPIStatus.OK)
+                event = response_buffer.get(uid)
+                if isinstance(event, tuple):
+                    _, event = event
+                event.set()
 
     async def run(
             self,
@@ -483,7 +521,7 @@ class BubbleServer:
         if num_api_servers is None:
             num_api_servers = len(self.workers)
 
-        manager, bubble_server_workers = await self.launch_inference_worker(num_api_servers)
+        self.manager, bubble_server_workers = await self.launch_inference_worker(num_api_servers)
 
         if sys.platform == "win32":
             api_server_worker_type = "thread"
@@ -492,13 +530,12 @@ class BubbleServer:
 
         try:
             servers = await self._start_server(port, num_api_servers, log_level, api_server_worker_type, **kwargs)
+            # Register signal handlers for graceful shutdown
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                asyncio.get_event_loop().add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.shutdown(s)))
             await asyncio.gather(*[s.serve() for s in servers])
         finally:
-            print("Shutting down bubble_server")
-            for w in bubble_server_workers:
-                w.terminate()
-                w.join()
-            manager.shutdown()
+            await self.shutdown()
 
     async def _start_server(self, port, num_uvicorn_servers, log_level, uvicorn_worker_type, **kwargs):
         servers = []
@@ -513,49 +550,13 @@ class BubbleServer:
             servers.append(server)
         return servers
 
-    def setup_auth(self):
-        if hasattr(self.bubble_api, "authorize") and callable(self.bubble_api.authorize):
-            return self.bubble_api.authorize
-        if BUBBLE_SERVER_API_KEY:
-            return api_key_auth
-        return no_auth
-
-    async def response_queue_to_buffer(
-            self,
-            response_queue: mp.Queue,
-            response_buffer: Dict[str, Union[Tuple[deque, asyncio.Event], asyncio.Event]],
-            stream: bool,
-            threadpool: ThreadPoolExecutor,
-    ):
-        loop = asyncio.get_running_loop()
-        if stream:
-            while True:
-                try:
-                    uid, response = await loop.run_in_executor(threadpool, response_queue.get)
-                except Empty:
-                    await asyncio.sleep(0.0001)
-                    continue
-                stream_response_buffer, event = response_buffer[uid]
-                stream_response_buffer.append(response)
-                event.set()
-        else:
-            while True:
-                uid, response = await loop.run_in_executor(threadpool, response_queue.get)
-                event = response_buffer.pop(uid)
-                response_buffer[uid] = response
-                event.set()
-
-
-if __name__ == "__main__":
-    class MyBubbleAPI(BubbleAPI):
-        async def setup(self, device: str):
-            print(f"Setting up MyBubbleAPI on device: {device}")
-
-        async def predict(self, x, **kwargs):
-            # Dummy prediction
-            return f"Prediction for input: {x}"
-
-
-    bubble_api = MyBubbleAPI()
-    server = BubbleServer(bubble_api)
-    asyncio.run(server.run())
+    async def shutdown(self, signal=None):
+        if signal:
+            print(f"Received exit signal {signal.name}...")
+        print("Shutting down bubble_server")
+        for process in self.processes:
+            process.terminate()
+            process.join()
+        if self.manager:
+            self.manager.shutdown()
+        print("Shutdown complete.")

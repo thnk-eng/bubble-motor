@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import inspect
 import json
 
-from .bubble_base import BubbleSpec
+from bubble_base import BubbleSpec
 
 
 class BubbleAPI(ABC):
@@ -51,11 +51,13 @@ class BubbleAPI(ABC):
         """Convert a batched output to a list of outputs."""
         return self._default_unbatch(output)
 
-    def encode_response(self, output, **kwargs):
+    @abstractmethod
+    async def encode_response(self, output, **kwargs):
         """Convert the model output to a response payload."""
-        if self._spec:
-            return self._spec.encode_response(output, **kwargs)
-        return output
+        pass
+        # if self._spec:
+         #   return self._spec.encode_response(output, **kwargs)
+        # return output
 
     def format_encoded_response(self, data):
         if isinstance(data, dict):

@@ -1,3 +1,5 @@
+# bubble-motor/example_openai_spec.py
+
 import asyncio
 import inspect
 import json
@@ -21,8 +23,10 @@ if typing.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 def shortuuid():
     return uuid.uuid4().hex[:6]
+
 
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
@@ -40,51 +44,63 @@ class UsageInfo(BaseModel):
             return self
         return self.__add__(other)
 
+
 class TextContent(BaseModel):
     type: str
     text: str
+
 
 class ImageDetail(str, Enum):
     auto: str = "auto"
     low: str = "low"
     high: str = "high"
 
+
 class ImageContentURL(BaseModel):
     url: str
     detail: ImageDetail = ImageDetail.auto
 
+
 class ImageContent(BaseModel):
     type: str
     image_url: Union[str, ImageContentURL]
+
 
 class Function(BaseModel):
     name: str
     description: str
     parameters: Dict[str, object]
 
+
 class ToolChoice(str, Enum):
     auto: str = "auto"
     none: str = "none"
     any: str = "any"
 
+
 class Tool(BaseModel):
     type: Literal["function"]
     function: Function
 
+
 class FunctionCall(BaseModel):
     name: str
     arguments: str
+
 
 class ToolCall(BaseModel):
     id: Optional[str] = None
     type: str = "function"
     function: FunctionCall
 
+
 class ResponseFormatText(BaseModel):
     type: Literal["text"]
 
+
 class ResponseFormatJSONObject(BaseModel):
     type: Literal["json_object"]
+
 
 class JSONSchema(BaseModel):
     name: str
@@ -92,13 +108,16 @@ class JSONSchema(BaseModel):
     schema_def: Optional[Dict[str, object]] = Field(None, alias="schema")
     strict: Optional[bool] = False
 
+
 class ResponseFormatJSONSchema(BaseModel):
     json_schema: JSONSchema
     type: Literal["json_schema"]
 
+
 ResponseFormat = Annotated[
     Union[ResponseFormatText, ResponseFormatJSONObject, ResponseFormatJSONSchema], "ResponseFormat"
 ]
+
 
 class ChatMessage(BaseModel):
     role: str
@@ -107,14 +126,17 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
 
+
 class ChatMessageWithUsage(ChatMessage):
     prompt_tokens: Optional[int] = 0
     total_tokens: Optional[int] = 0
     completion_tokens: Optional[int] = 0
 
+
 class ChoiceDelta(ChatMessage):
     content: Optional[str] = None
     role: Optional[Literal["system", "user", "assistant", "tool"]] = None
+
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = ""
@@ -132,10 +154,12 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[ToolChoice] = ToolChoice.auto
     response_format: Optional[ResponseFormat] = None
 
+
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     finish_reason: Optional[Literal["stop", "length"]]
+
 
 class ChatCompletionResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{shortuuid()}")
@@ -145,11 +169,13 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
 
+
 class ChatCompletionStreamingChoice(BaseModel):
     delta: Optional[ChoiceDelta]
     finish_reason: Optional[Literal["stop", "length", "tool_calls", "content_filter", "function_call"]] = None
     index: int
     logprobs: Optional[dict] = None
+
 
 class ChatCompletionChunk(BaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{shortuuid()}")
@@ -159,6 +185,7 @@ class ChatCompletionChunk(BaseModel):
     system_fingerprint: Optional[str] = None
     choices: List[ChatCompletionStreamingChoice]
     usage: Optional[UsageInfo]
+
 
 BubbleAPI_VALIDATION_MSG = """BubbleAPI.predict and BubbleAPI.encode_response must be a generator (use yield instead or return)
 while using the OpenAISpec.
@@ -197,7 +224,6 @@ class ExampleAPI(ls.BubbleAPI):
         yield ChatMessage(role="assistant", content="This is a custom encoded output")
 ```
 
-
 You can also yield responses in chunks. bubble_motor will handle the streaming for you:
 
 ```
@@ -212,6 +238,7 @@ class ExampleAPI(ls.BubbleAPI):
 ```
 """
 
+
 class OpenAISpec(BubbleSpec):
     def __init__(self):
         super().__init__()
@@ -219,7 +246,7 @@ class OpenAISpec(BubbleSpec):
         self.add_endpoint("/v1/chat/completions", self.options_chat_completions, ["OPTIONS"])
 
     def setup(self, server: "BubbleServer"):
-        from bubble_motor.api import BubbleAPI
+        from .api import BubbleAPI
 
         super().setup(server)
 
@@ -234,7 +261,7 @@ class OpenAISpec(BubbleSpec):
 
     def populate_context(self, context, request):
         data = request.dict()
-        data.pop("messages")
+        data.pop("messages", None)
         context.update(data)
 
     def decode_request(self, request: ChatCompletionRequest, context_kwargs: Optional[dict] = None) -> List[Dict[str, str]]:
@@ -280,13 +307,6 @@ class OpenAISpec(BubbleSpec):
         usage_info = self.extract_usage_info(message)
         return {**message, **usage_info}
 
-    def encode_response(
-        self, output_generator: Union[Dict[str, str], List[Dict[str, str]]], context_kwargs: Optional[dict] = None
-    ) -> Iterator[Union[ChatMessage, ChatMessageWithUsage]]:
-        for output in output_generator:
-            logger.debug(output)
-            yield self._encode_response(output)
-
     async def get_from_queues(self, uids) -> List[AsyncGenerator]:
         choice_pipes = []
         for uid, q, event in zip(uids, self.queues, self.events):
@@ -300,7 +320,7 @@ class OpenAISpec(BubbleSpec):
     async def chat_completion(self, request: ChatCompletionRequest, background_tasks: BackgroundTasks):
         response_queue_id = self.response_queue_id
         logger.debug("Received chat completion request %s", request)
-        uids = [uuid.uuid4() for _ in range(request.n)]
+        uids = [str(uuid.uuid4()) for _ in range(request.n)]
         self.queues = []
         self.events = []
         for uid in uids:
@@ -308,7 +328,7 @@ class OpenAISpec(BubbleSpec):
             request_el.n = 1
             q = deque()
             event = asyncio.Event()
-            self._server.response_buffer[uid] = (q, event)
+            self._server.response_buffer[uid] = (q, event, BubbleAPIStatus.PROCESSING)
             self._server.request_queue.put((response_queue_id, uid, time.monotonic(), request_el))
             self.queues.append(q)
             self.events.append(event)
@@ -363,29 +383,29 @@ class OpenAISpec(BubbleSpec):
             yield f"data: {last_chunk}\n\n"
             yield "data: [DONE]\n\n"
 
-        async def non_streaming_completion(self, request: ChatCompletionRequest, generator_list: List[AsyncGenerator]):
-            model = request.model
-            usage_infos = []
-            choices = []
-            for i, streaming_response in enumerate(generator_list):
-                msgs = []
-                tool_calls = None
-                usage = None
-                async for response, status in streaming_response:
-                    if status == BubbleAPIStatus.ERROR:
-                        load_and_raise(response)
-                    encoded_response = json.loads(response)
-                    logger.debug(encoded_response)
-                    chat_msg = ChatMessage(**encoded_response)
-                    usage = UsageInfo(**encoded_response)
-                    msgs.append(chat_msg.content)
-                    if chat_msg.tool_calls:
-                        tool_calls = chat_msg.tool_calls
+    async def non_streaming_completion(self, request: ChatCompletionRequest, generator_list: List[AsyncGenerator]):
+        model = request.model
+        usage_infos = []
+        choices = []
+        for i, streaming_response in enumerate(generator_list):
+            msgs = []
+            tool_calls = None
+            usage = None
+            async for response, status in streaming_response:
+                if status == BubbleAPIStatus.ERROR:
+                    load_and_raise(response)
+                encoded_response = json.loads(response)
+                logger.debug(encoded_response)
+                chat_msg = ChatMessage(**encoded_response)
+                usage = UsageInfo(**encoded_response)
+                msgs.append(chat_msg.content)
+                if chat_msg.tool_calls:
+                    tool_calls = chat_msg.tool_calls
 
-                content = "".join(msgs)
-                msg = {"role": "assistant", "content": content, "tool_calls": tool_calls}
-                choice = ChatCompletionResponseChoice(index=i, message=msg, finish_reason="stop")
-                choices.append(choice)
-                usage_infos.append(usage)  # Only use the last item from encode_response
+            content = "".join(msgs)
+            msg = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+            choice = ChatCompletionResponseChoice(index=i, message=msg, finish_reason="stop")
+            choices.append(choice)
+            usage_infos.append(usage)  # Only use the last item from encode_response
 
-            return ChatCompletionResponse(model=model, choices=choices, usage=sum(usage_infos))
+        return ChatCompletionResponse(model=model, choices=choices, usage=sum(usage_infos))

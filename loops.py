@@ -9,9 +9,9 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from fastapi import HTTPException
 
-from .server import BubbleAPI
-from .bubble_base import BubbleSpec
-from .utils import BubbleAPIStatus
+from server import BubbleAPI
+from bubble_base import BubbleSpec
+from utils import BubbleAPIStatus
 
 mp.allow_connection_pickling()
 
